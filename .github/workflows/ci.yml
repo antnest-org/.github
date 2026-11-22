@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Profile README & Markdown Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Validate profile/README.md and Markdown links
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import re
+          import sys
+          import urllib.parse
+
+          readme = pathlib.Path("profile/README.md")
+          if not readme.is_file():
+              print("Missing profile/README.md", file=sys.stderr)
+              sys.exit(1)
+
+          readme_text = readme.read_text(encoding="utf-8")
+          if not readme_text.strip():
+              print("profile/README.md is empty", file=sys.stderr)
+              sys.exit(1)
+          if not re.search(r"^#\s+\S+", readme_text, re.MULTILINE):
+              print("profile/README.md missing top-level Markdown heading", file=sys.stderr)
+              sys.exit(1)
+
+          md_files = sorted(
+              p for p in pathlib.Path(".").rglob("*.md") if ".git" not in p.parts
+          )
+          link_re = re.compile(r"!?\[([^\]]*)\]\(([^)]+)\)")
+          errors = []
+
+          for md in md_files:
+              text = md.read_text(encoding="utf-8")
+              if not text.strip():
+                  errors.append(f"{md}: empty markdown file")
+                  continue
+              if text.count("```") % 2 != 0:
+                  errors.append(f"{md}: unbalanced fenced code block")
+
+              cleaned = re.sub(r"```[\s\S]*?```", "", text)
+              cleaned = re.sub(r"`[^`\n]*`", "", cleaned)
+              for idx, line in enumerate(cleaned.splitlines(), start=1):
+                  if re.search(r"!?\[[^\]]*\]\(\s*\)", line):
+                      errors.append(f"{md}:{idx}: empty markdown link target")
+
+              for match in link_re.finditer(cleaned):
+                  raw_target = match.group(2).strip()
+                  if raw_target.startswith("<") and ">" in raw_target:
+                      target = raw_target[1 : raw_target.index(">")].strip()
+                  else:
+                      target = raw_target.split()[0].strip()
+                  if not target or target.startswith("#"):
+                      continue
+                  if target.startswith(("http://", "https://")):
+                      parsed = urllib.parse.urlsplit(target)
+                      if not parsed.netloc or " " in target:
+                          errors.append(f"{md}: malformed URL {target}")
+                  elif target.startswith("mailto:"):
+                      if "@" not in target:
+                          errors.append(f"{md}: malformed mailto link {target}")
+                  else:
+                      rel_path = target.split("#", 1)[0].split("?", 1)[0].strip()
+                      if not (md.parent / rel_path).resolve().exists():
+                          errors.append(f"{md}: broken relative link {raw_target}")
+
+          if errors:
+              for err in errors:
+                  print(f"ERROR: {err}", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"Markdown validation OK ({len(md_files)} file(s), profile/README.md={len(readme_text)} bytes)")
+          PY
